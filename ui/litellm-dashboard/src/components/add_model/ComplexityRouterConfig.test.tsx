@@ -28,6 +28,8 @@ const baseProps = {
   modelInfo: mockModelInfo,
   value: defaultValue,
   onChange: vi.fn(),
+  editingTiers: false,
+  onEditingTiersChange: vi.fn(),
   keywordTierRules: [],
   onKeywordTierRulesChange: vi.fn(),
   semanticMatchingEnabled: false,
@@ -941,5 +943,221 @@ describe("ComplexityRouterConfig reasoning effort gating", () => {
     expect(
       screen.getByRole("combobox", { name: "Reasoning effort for gpt-3.5-turbo in the Simple tier" }),
     ).toHaveTextContent("low");
+  });
+});
+
+describe("edit tiers", () => {
+  const customValue: ComplexityRouterConfigValue = {
+    ...defaultValue,
+    classifier_type: "llm",
+    classifier_llm_config: { model: "gpt-3.5-turbo", timeout_ms: 3000 },
+    custom_tier_set: {
+      tiers: [
+        { id: "SIMPLE", name: "SIMPLE", definition: "", models: ["gpt-3.5-turbo"] },
+        { id: "COMPLEX", name: "COMPLEX", definition: "", models: ["gpt-4"] },
+        { id: "sec", name: "AUDIT", definition: "security audits", models: ["claude-3-opus"] },
+      ],
+      fallback_tier_id: "COMPLEX",
+    },
+  };
+
+  it("removing a built-in tier materializes the ordered row set and touches nothing else", async () => {
+    const onChange = vi.fn();
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Remove the MEDIUM tier" }));
+    expect(onChange).toHaveBeenCalledWith({
+      ...defaultValue,
+      custom_tier_set: {
+        tiers: [
+          { id: "SIMPLE", name: "SIMPLE", definition: "", models: defaultValue.tiers.SIMPLE },
+          { id: "COMPLEX", name: "COMPLEX", definition: "", models: defaultValue.tiers.COMPLEX },
+          { id: "REASONING", name: "REASONING", definition: "", models: defaultValue.tiers.REASONING },
+        ],
+        fallback_tier_id: "SIMPLE",
+      },
+    });
+  });
+
+  it("restoring the removed built-in returns the exact pre-edit value, so undo leaves nothing behind", async () => {
+    const onChange = vi.fn();
+    const removed: ComplexityRouterConfigValue = {
+      ...defaultValue,
+      custom_tier_set: {
+        tiers: (["SIMPLE", "COMPLEX", "REASONING"] as const).map((tier) => ({
+          id: tier,
+          name: tier,
+          definition: "",
+          models: defaultValue.tiers[tier],
+        })),
+        fallback_tier_id: "SIMPLE",
+      },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={removed} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Restore MEDIUM" }));
+    expect(onChange).toHaveBeenCalledWith(defaultValue);
+  });
+
+  it("removing a row snapshots its in-editor models so Restore returns them, not a stale pool", async () => {
+    const onChange = vi.fn();
+    const edited: ComplexityRouterConfigValue = {
+      ...customValue,
+      custom_tier_set: {
+        ...customValue.custom_tier_set!,
+        tiers: customValue.custom_tier_set!.tiers.map((row) =>
+          row.id === "SIMPLE" ? { ...row, models: ["edited-in-editor"] } : row,
+        ),
+      },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={edited} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Remove the SIMPLE tier" }));
+    const next = onChange.mock.calls[0][0] as ComplexityRouterConfigValue;
+    expect(next.tiers.SIMPLE).toEqual(["edited-in-editor"]);
+    expect(next.custom_tier_set?.tiers.some((row) => row.id === "SIMPLE")).toBe(false);
+  });
+
+  it("tells the custom-tier routing story instead of the heuristic score bands", async () => {
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={customValue} />);
+    await userEvent.click(screen.getByText("Advanced: Classification Method"));
+    expect(screen.getByText(/matching it against your tier definitions/)).toBeInTheDocument();
+    expect(screen.queryByText(/Score </)).not.toBeInTheDocument();
+  });
+
+  it("warns that a configured classifier prompt is unused with an edited tier set", async () => {
+    const withPrompt: ComplexityRouterConfigValue = {
+      ...customValue,
+      classifier_llm_config: { model: "gpt-3.5-turbo", timeout_ms: 3000, system_prompt: "grade it my way" },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={withPrompt} />);
+    await userEvent.click(screen.getByText("Advanced: Classification Method"));
+    expect(screen.getByText(/prompt and rubric preset are not used with an edited tier set/)).toBeInTheDocument();
+  });
+
+  it("shows name and definition inputs for the rows and disables session pinning with a hint", async () => {
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={customValue} />);
+    expect(screen.getByLabelText("Name for tier 3")).toHaveValue("AUDIT");
+    expect(screen.getByLabelText("Definition for tier 3")).toHaveValue("security audits");
+    expect(screen.queryByLabelText("Display name for the Simple tier")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText("Advanced: Affinity"));
+    expect(screen.getByLabelText("Pin a session to its first model")).toHaveAttribute("data-disabled");
+    expect(screen.getByText(/Unavailable with an edited tier set: escalating a pinned session/)).toBeInTheDocument();
+  });
+  it("params key by row id, so a rename needs no bookkeeping and unnamed rows cannot collide", async () => {
+    const onChange = vi.fn();
+    const withParams: ComplexityRouterConfigValue = {
+      ...customValue,
+      tier_model_params: { sec: { "claude-3-opus": { reasoning_effort: "high" } } },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={withParams} onChange={onChange} />);
+    fireEvent.change(screen.getByLabelText("Name for tier 3"), { target: { value: "SECURITY_REVIEW" } });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0] as ComplexityRouterConfigValue;
+    expect(next.custom_tier_set?.tiers[2].name).toBe("SECURITY_REVIEW");
+    expect(next.tier_model_params).toEqual({ sec: { "claude-3-opus": { reasoning_effort: "high" } } });
+  });
+
+  it("removing the only custom row exits custom mode entirely, so undoing an add leaves nothing behind", async () => {
+    const onChange = vi.fn();
+    const added: ComplexityRouterConfigValue = {
+      ...defaultValue,
+      custom_tier_set: {
+        tiers: [
+          ...(["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"] as const).map((tier) => ({
+            id: tier,
+            name: tier,
+            definition: "",
+            models: defaultValue.tiers[tier],
+          })),
+          { id: "new-1", name: "", definition: "", models: [] },
+        ],
+        fallback_tier_id: "MEDIUM",
+      },
+    };
+    renderWithProviders(
+      <ComplexityRouterConfig
+        {...baseProps}
+        value={{ ...added, tier_model_params: { "new-1": { opus: { reasoning_effort: "high" } } } }}
+        onChange={onChange}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Remove the tier 5 tier" }));
+    expect(onChange).toHaveBeenCalledWith(defaultValue);
+  });
+
+  it("clears the plan-mode floor when its row is removed, and keeps a built-in floor through mode exit", async () => {
+    const onChange = vi.fn();
+    const withFloor: ComplexityRouterConfigValue = { ...customValue, plan_mode_min_tier: "sec" };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={withFloor} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Remove the AUDIT tier" }));
+    expect((onChange.mock.calls[0][0] as ComplexityRouterConfigValue).plan_mode_min_tier).toBeUndefined();
+  });
+
+  it("keeps a built-in plan-mode floor when the set returns to the default four", async () => {
+    const onChange = vi.fn();
+    const removedWithFloor: ComplexityRouterConfigValue = {
+      ...defaultValue,
+      plan_mode_min_tier: "COMPLEX",
+      custom_tier_set: {
+        tiers: (["SIMPLE", "COMPLEX", "REASONING"] as const).map((tier) => ({
+          id: tier,
+          name: tier,
+          definition: "",
+          models: defaultValue.tiers[tier],
+        })),
+        fallback_tier_id: "SIMPLE",
+      },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={removedWithFloor} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Restore MEDIUM" }));
+    expect(onChange).toHaveBeenCalledWith({ ...defaultValue, plan_mode_min_tier: "COMPLEX" });
+  });
+
+  it("a hydrated set that merely looks default stays custom on a model edit, keeping stored keys alive", async () => {
+    const onChange = vi.fn();
+    const hydratedThree: ComplexityRouterConfigValue = {
+      ...defaultValue,
+      custom_tier_set: {
+        tiers: (["SIMPLE", "COMPLEX", "REASONING"] as const).map((tier) => ({
+          id: tier,
+          name: tier,
+          definition: "",
+          models: defaultValue.tiers[tier],
+        })),
+        fallback_tier_id: "SIMPLE",
+        hydrated: true,
+      },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={hydratedThree} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Restore MEDIUM" }));
+    const next = onChange.mock.calls.at(-1)?.[0] as ComplexityRouterConfigValue;
+    expect(next.custom_tier_set).toMatchObject({ hydrated: true });
+    expect(next.custom_tier_set?.tiers).toHaveLength(4);
+  });
+
+  it("exits a hydrated set only through the explicit built-in tiers action", async () => {
+    const onChange = vi.fn();
+    const hydratedDefault: ComplexityRouterConfigValue = {
+      ...defaultValue,
+      custom_tier_set: {
+        tiers: (["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"] as const).map((tier) => ({
+          id: tier,
+          name: tier,
+          definition: "",
+          models: defaultValue.tiers[tier],
+        })),
+        fallback_tier_id: "MEDIUM",
+        hydrated: true,
+      },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={hydratedDefault} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Use built-in tiers" }));
+    const exited = onChange.mock.calls.at(-1)?.[0] as ComplexityRouterConfigValue;
+    expect(exited.custom_tier_set).toBeUndefined();
+    expect(exited.tiers).toEqual(defaultValue.tiers);
+  });
+
+  it("shows the editor controls from the parent-owned editing flag, surviving a section remount", () => {
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers />);
+    expect(screen.getByRole("button", { name: "Add tier" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
   });
 });
