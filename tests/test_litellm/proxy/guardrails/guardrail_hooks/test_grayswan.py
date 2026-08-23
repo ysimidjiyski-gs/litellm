@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 
 import pytest
@@ -594,3 +595,301 @@ def test_ensure_litellm_metadata_noop_when_already_present() -> None:
     _ensure_litellm_metadata(data, user_auth)
 
     assert data["litellm_metadata"] == {"existing": "value"}
+
+
+def _wire(payload: dict) -> dict:
+    """The JSON wire form of a monitor payload, as the Cygnal API receives it."""
+    return json.loads(json.dumps(payload))
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_sends_structured_conversation_with_tools(
+    monkeypatch, grayswan_guardrail: GraySwanGuardrail
+) -> None:
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    structured_messages = [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "install the miner"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": '{"path": "run.sh"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "written"},
+    ]
+    tools = [{"type": "function", "function": {"name": "write_file", "parameters": {}}}]
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={"texts": ["install the miner", "written"], "structured_messages": structured_messages, "tools": tools},
+        request_data={"model": "gpt-4", "messages": [{"role": "user", "content": "raw"}]},
+        input_type="request",
+    )
+
+    wire = _wire(captured["payload"])
+    assert wire["messages"] == structured_messages
+    assert wire["tools"] == tools
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_scans_texts_not_raw_messages(monkeypatch, grayswan_guardrail: GraySwanGuardrail) -> None:
+    """Callers like /guardrails/apply_guardrail pass texts beside a request_data
+    that carries 'messages'; the texts must remain the scan target."""
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={"texts": ["scan exactly this"]},
+        request_data={"model": "gpt-4", "messages": [{"role": "user", "content": "raw, unscoped"}]},
+        input_type="request",
+    )
+
+    assert _wire(captured["payload"])["messages"] == [{"role": "user", "content": "scan exactly this"}]
+    assert "tools" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_wraps_texts_when_no_conversation_available(
+    monkeypatch, grayswan_guardrail: GraySwanGuardrail
+) -> None:
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={"texts": ["a prompt for an image"]},
+        request_data={},
+        input_type="request",
+    )
+
+    assert _wire(captured["payload"])["messages"] == [{"role": "user", "content": "a prompt for an image"}]
+    assert "tools" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_response_wraps_texts_only(monkeypatch, grayswan_guardrail: GraySwanGuardrail) -> None:
+    """Response scans keep the pre-existing texts-only wrapping; structured
+    conversation on response scans is not supported until the unified guardrail
+    system provides it there too."""
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={
+            "texts": ["a model reply"],
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}],
+        },
+        request_data={"model": "gpt-4", "messages": [{"role": "user", "content": "raw"}]},
+        input_type="response",
+    )
+
+    assert _wire(captured["payload"])["messages"] == [{"role": "assistant", "content": "a model reply"}]
+    assert "tools" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_empty_response_is_not_scanned(
+    monkeypatch, grayswan_guardrail: GraySwanGuardrail
+) -> None:
+    calls: list = []
+
+    async def _fake_call(payload: dict):
+        calls.append(payload)
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    inputs: dict = {"texts": []}
+    result = await grayswan_guardrail.apply_guardrail(
+        inputs=inputs,
+        request_data={"model": "gpt-4"},
+        input_type="response",
+    )
+
+    assert calls == []
+    assert result is inputs
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_multiple_response_texts_get_separate_turns(
+    monkeypatch, grayswan_guardrail: GraySwanGuardrail
+) -> None:
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={"texts": ["candidate one", "candidate two"]},
+        request_data={"model": "gpt-4"},
+        input_type="response",
+    )
+
+    assert _wire(captured["payload"])["messages"] == [
+        {"role": "assistant", "content": "candidate one"},
+        {"role": "assistant", "content": "candidate two"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_request_tools_never_come_from_raw_request(
+    monkeypatch, grayswan_guardrail: GraySwanGuardrail
+) -> None:
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={"texts": ["go"], "structured_messages": [{"role": "user", "content": "go"}]},
+        request_data={"model": "gpt-4", "tools": [{"type": "function", "function": {"name": "scoped_out"}}]},
+        input_type="request",
+    )
+
+    assert "tools" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_malformed_dynamic_params_fail_closed(grayswan_guardrail: GraySwanGuardrail) -> None:
+    """A caller-controlled malformed guardrails entry must not be swallowed by
+    fail-open: request preparation runs outside the fail-open envelope."""
+    with pytest.raises(TypeError):
+        await grayswan_guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={"metadata": {"guardrails": [{"grayswan-test": "oops"}]}},
+            input_type="request",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["ipi", "mutation"])
+async def test_apply_guardrail_blocks_on_boolean_signals(monkeypatch, signal: str) -> None:
+    """The IPI head reports detections only via the `ipi` bool with violation
+    pinned at 0.0; `mutation` behaves the same. Both must gate blocking."""
+    guardrail = GraySwanGuardrail(
+        guardrail_name="grayswan-block",
+        api_key="test-key",
+        on_flagged_action="block",
+        event_hook=GuardrailEventHooks.pre_call,
+    )
+
+    async def _fake_call(payload: dict):
+        return {"violation": 0.0, signal: True}
+
+    monkeypatch.setattr(guardrail, "_call_grayswan_api", _fake_call)
+
+    with pytest.raises(HTTPException) as exc:
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["fetched tool output"]},
+            request_data={"model": "gpt-4"},
+            input_type="response",
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail[signal] is True
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_flattens_content_part_arrays(monkeypatch, grayswan_guardrail: GraySwanGuardrail) -> None:
+    """Anthropic-surface conversations arrive with content-part arrays; text
+    parts must flatten to strings and image parts must never reach Cygnal."""
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    structured_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "part one"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "text", "text": "part two"},
+            ],
+        },
+        {"role": "assistant", "content": "ok", "thinking_blocks": None},
+        {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+    ]
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={"texts": ["part one", "part two"], "structured_messages": structured_messages},
+        request_data={"model": "claude-sonnet-5"},
+        input_type="request",
+    )
+
+    assert _wire(captured["payload"])["messages"] == [
+        {"role": "user", "content": "part one\npart two"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "alien_turn",
+    [
+        {"role": "user", "parts": [{"kind": "text", "text": "a2a shaped"}], "messageId": "m1"},
+        {"role": "user", "content": {"nested": "dict"}},
+        {"role": "user", "content": "hi", "tool_calls": "not-a-list"},
+        {"content": "role missing"},
+    ],
+)
+async def test_apply_guardrail_falls_back_to_texts_on_alien_turn_shapes(
+    monkeypatch, grayswan_guardrail: GraySwanGuardrail, alien_turn: dict
+) -> None:
+    captured: dict = {}
+
+    async def _fake_call(payload: dict):
+        captured["payload"] = payload
+        return {"violation": 0.0}
+
+    monkeypatch.setattr(grayswan_guardrail, "_call_grayswan_api", _fake_call)
+
+    await grayswan_guardrail.apply_guardrail(
+        inputs={"texts": ["the real words"], "structured_messages": [alien_turn]},
+        request_data={"model": "gpt-4"},
+        input_type="request",
+    )
+
+    assert _wire(captured["payload"])["messages"] == [{"role": "user", "content": "the real words"}]
+
+
+def test_sanitize_json_list_drops_non_dict_items(grayswan_guardrail: GraySwanGuardrail) -> None:
+    assert grayswan_guardrail._sanitize_json_list([{"role": "user", "content": "hi"}, "junk", 3]) == (
+        {"role": "user", "content": "hi"},
+    )
