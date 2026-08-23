@@ -970,6 +970,19 @@ class Mode(BaseModel):
     default: str | list[str] | None = Field(default=None, description="Default mode when no tags match")
 
 
+class GuardrailOptionalParams(BaseModel):
+    """Vendor-agnostic container for a guardrail's optional_params.
+
+    LitellmParams merges every vendor's config model, so a typed optional_params
+    field would resolve to whichever vendor model comes first in the MRO and
+    silently validate every other vendor's params against it. This open model
+    keeps all keys and exposes them via attribute access, which is how guardrail
+    initializers read them.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
 class LitellmParams(
     CiscoAIDefenseGuardrailConfigModel,
     PresidioConfigModel,
@@ -1003,6 +1016,21 @@ class LitellmParams(
     guardrail: str = Field(description="The type of guardrail integration to use")
     mode: str | list[str] | Mode = Field(
         description="When to apply the guardrail (pre_call, post_call, during_call, logging_only)"
+    )
+    policy_id: (  # pyright: ignore[reportIncompatibleVariableOverride]  # int ids (zscaler) and str ids (grayswan)
+        str | int | None
+    ) = Field(
+        default=None,
+        description=(
+            "Policy id for the guardrail. Shared by integrations with integer ids "
+            "(zscaler_ai_guard) and string ids (grayswan)."
+        ),
+    )
+    optional_params: (  # pyright: ignore[reportIncompatibleVariableOverride]  # deliberate cross-vendor passthrough
+        GuardrailOptionalParams | None
+    ) = Field(
+        default=None,
+        description="Optional provider-specific parameters for the guardrail",
     )
 
     @field_validator("timeout", mode="before", check_fields=False)
