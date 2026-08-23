@@ -11,10 +11,16 @@ if TYPE_CHECKING:
 def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"):
     import litellm
 
+    policy_id: Final = litellm_params.policy_id
+    try:
+        policy_id_int: Final = int(policy_id) if policy_id is not None else None
+    except ValueError as e:
+        raise ValueError(f"zscaler_ai_guard policy_id must be an integer, got {policy_id!r}") from e
+
     _zscaler_ai_guard_callback: Final = ZscalerAIGuard(
         api_base=litellm_params.api_base,
         api_key=litellm_params.api_key,
-        policy_id=litellm_params.policy_id,
+        policy_id=policy_id_int,
         send_user_api_key_alias=litellm_params.send_user_api_key_alias,
         send_user_api_key_user_id=litellm_params.send_user_api_key_user_id,
         send_user_api_key_team_id=litellm_params.send_user_api_key_team_id,
