@@ -1577,3 +1577,156 @@ def test_credential_like_headers_are_never_forwarded_but_session_headers_are(
         "x-claude-code-prompt-id": "prompt-1",
         "x-client-request-id": "request-1",
     }
+
+
+@pytest.mark.parametrize("status", [400, 413, 422])
+@pytest.mark.parametrize("input_type", ["request", "response"])
+@pytest.mark.asyncio
+async def test_payload_rejection_after_the_text_rescan_fails_closed_even_with_fail_open(
+    status: int, input_type: str
+) -> None:
+    guardrail = _guardrail(fail_open=True)
+    monitor = _StrictMonitor(rejects=lambda _message: True, status=status)
+    guardrail.async_handler = monitor
+    request_data: dict[str, object] = {**_REQUEST_DATA, "litellm_logging_obj": _LoggingObj("acompletion")}
+
+    with pytest.raises(GraySwanGuardrailAPIError):
+        await guardrail.apply_guardrail(
+            inputs={
+                "texts": ["summarize my inbox"],
+                "structured_messages": _REQUEST_DATA["messages"],
+            },
+            request_data=request_data,
+            input_type=input_type,
+            logging_obj=_LoggingObj("acompletion"),
+        )
+
+    assert len(monitor.calls) == 2
+    assert _recorded_scans(request_data)[-1]["guardrail_response"]["outcome"] == "fail_closed"
+
+
+@pytest.mark.asyncio
+async def test_payload_rejection_without_any_text_to_rescan_fails_closed() -> None:
+    guardrail = _guardrail(fail_open=True)
+    monitor = _StrictMonitor(rejects=lambda _message: True)
+    guardrail.async_handler = monitor
+
+    with pytest.raises(GraySwanGuardrailAPIError):
+        await guardrail.apply_guardrail(
+            inputs={"texts": [], "structured_messages": _REQUEST_DATA["messages"]},
+            request_data={},
+            input_type="request",
+        )
+
+    assert len(monitor.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "dynamic_policy", "fails_open"),
+    [(401, False, True), (403, False, True), (500, False, True), (404, False, True), (404, True, False)],
+)
+@pytest.mark.asyncio
+async def test_only_operator_and_availability_errors_follow_fail_open(
+    monkeypatch: pytest.MonkeyPatch, status: int, dynamic_policy: bool, fails_open: bool
+) -> None:
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+    guardrail = _guardrail(fail_open=True)
+    guardrail.async_handler = _StrictMonitor(rejects=lambda _message: True, status=status)
+    request_data: dict[str, object] = (
+        {"guardrails": [{"grayswan-test": {"extra_body": {"policy_id": "someone-elses-policy"}}}]}
+        if dynamic_policy
+        else {}
+    )
+
+    call = guardrail.apply_guardrail(inputs={"texts": ["hi"]}, request_data=request_data, input_type="request")
+
+    if fails_open:
+        assert (await call)["texts"] == ["hi"]
+    else:
+        with pytest.raises(GraySwanGuardrailAPIError):
+            await call
+
+
+@pytest.mark.parametrize(
+    ("extra_body", "invalid"),
+    [
+        ({"reasoning_mode": "bogus"}, "reasoning_mode"),
+        ({"categories": 5}, "categories"),
+        ({"categories": ["ok", 5]}, "categories"),
+        ({"policy_id": ["x"]}, "policy_id"),
+        ({"metadata": "not-a-dict"}, "metadata"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_extra_body_values_block_without_calling_grayswan(
+    monkeypatch: pytest.MonkeyPatch, extra_body: dict[str, object], invalid: str
+) -> None:
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+    guardrail = _guardrail(fail_open=True)
+    client = _CapturingClient()
+    guardrail.async_handler = client
+
+    with pytest.raises(HTTPException) as exc:
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hi"]},
+            request_data={"guardrails": [{"grayswan-test": {"extra_body": extra_body}}]},
+            input_type="request",
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == {
+        "error": f"Invalid Gray Swan guardrail parameters in extra_body: {invalid}",
+        "type": "grayswan_guardrail_invalid_params",
+    }
+    assert client.calls == ()
+
+
+@pytest.mark.parametrize(
+    "extra_body",
+    [
+        {"reasoning_mode": "thinking"},
+        {"categories": {"safety": "general"}},
+        {"categories": ["safety"]},
+        {"categories": [{"safety": "general"}]},
+        {"policy_id": "policy-1", "metadata": {"trace": "t"}},
+    ],
+)
+@pytest.mark.asyncio
+async def test_valid_extra_body_values_are_sent(monkeypatch: pytest.MonkeyPatch, extra_body: dict[str, object]) -> None:
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+    guardrail = _guardrail(on_flagged_action="monitor")
+    client = _CapturingClient()
+    guardrail.async_handler = client
+
+    await guardrail.apply_guardrail(
+        inputs={"texts": ["hi"]},
+        request_data={"guardrails": [{"grayswan-test": {"extra_body": extra_body}}]},
+        input_type="request",
+    )
+
+    sent = client.calls[0]["json"]
+    assert {name: sent[name] for name in extra_body if name != "metadata"} == {
+        name: value for name, value in extra_body.items() if name != "metadata"
+    }
+
+
+@pytest.mark.parametrize(("buffered", "raised"), [(True, ModifyResponseException), (False, HTTPException)])
+@pytest.mark.asyncio
+async def test_streamed_passthrough_without_buffering_ends_with_the_block_error(
+    buffered: bool, raised: type[Exception]
+) -> None:
+    guardrail = GraySwanGuardrail(
+        guardrail_name="grayswan-post-call",
+        api_key="test-key",
+        on_flagged_action="passthrough",
+        streaming_buffer_until_moderated=buffered,
+        event_hook=GuardrailEventHooks.post_call,
+    )
+    guardrail.async_handler = _CapturingClient({"violation": 1.0})
+
+    with pytest.raises(raised) as exc:
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["flagged text"]}, request_data={"stream": True}, input_type="response"
+        )
+
+    assert isinstance(exc.value, ModifyResponseException) == buffered

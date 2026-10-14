@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import accumulate, chain
 from types import MappingProxyType
@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 GRAYSWAN_BLOCK_ERROR_MSG: Final = "Blocked by Gray Swan Guardrail"
 GRAYSWAN_BLOCK_TYPE: Final = "grayswan_guardrail_block"
+GRAYSWAN_INVALID_PARAMS_TYPE: Final = "grayswan_guardrail_invalid_params"
 GRAYSWAN_BLOCK_STATUS_CODES: Final = frozenset({400, 403, 422})
 
 DEFAULT_FORWARDED_HEADERS: Final = (
@@ -133,6 +134,9 @@ class _MonitorFailure:
     @property
     def rejected_shape(self) -> bool:
         return not self.timed_out and self.status_code in _SHAPE_REJECTION_STATUSES
+
+    def rejected_payload(self, *, client_policy: bool) -> bool:
+        return self.rejected_shape or (client_policy and self.status_code == 404)
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +318,40 @@ def _monitor_wire_messages(messages: Sequence[Mapping[str, object]]) -> tuple[Ma
         _normalize_message(message, index, legacy_call_ids[index]) if _needs_normalization(message) else message
         for index, message in enumerate(messages)
     )
+
+
+def _is_string_mapping(value: object) -> bool:
+    mapping: Final = _as_mapping(value)
+    return isinstance(value, Mapping) and all(isinstance(text, str) for text in mapping.values())
+
+
+def _is_categories(value: object) -> bool:
+    items: Final = _as_items(value)
+    is_array: Final = isinstance(value, (list, tuple))
+    return _is_string_mapping(value) or (
+        is_array and (all(isinstance(item, str) for item in items) or all(_is_string_mapping(item) for item in items))
+    )
+
+
+def _is_string(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _is_mapping(value: object) -> bool:
+    return isinstance(value, Mapping)
+
+
+def _invalid_dynamic_params(dynamic_body: Mapping[str, object], reasoning_modes: frozenset[str]) -> tuple[str, ...]:
+    def is_reasoning_mode(value: object) -> bool:
+        return isinstance(value, str) and value in reasoning_modes
+
+    checks: Final[tuple[tuple[str, Callable[[object], bool]], ...]] = (
+        ("reasoning_mode", is_reasoning_mode),
+        ("categories", _is_categories),
+        ("policy_id", _is_string),
+        ("metadata", _is_mapping),
+    )
+    return tuple(name for name, is_valid in checks if name in dynamic_body and not is_valid(dynamic_body[name]))
 
 
 def _monitor_headers(configured: object) -> Mapping[str, str]:
@@ -560,11 +598,26 @@ class GraySwanGuardrail(CustomGuardrail):
             self._record_scan(request_data, logging_obj, is_output=is_output, outcome="skipped", start_time=start_time)
             return inputs
 
-        dynamic_body: Final = self.get_guardrail_dynamic_request_body_params(request_data) or {}
+        dynamic_body: Final = _as_mapping(self.get_guardrail_dynamic_request_body_params(request_data))
+        invalid_params: Final = _invalid_dynamic_params(dynamic_body, frozenset(self.SUPPORTED_REASONING_MODES))
+        if invalid_params:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"Invalid Gray Swan guardrail parameters in extra_body: {', '.join(invalid_params)}",
+                    "type": GRAYSWAN_INVALID_PARAMS_TYPE,
+                },
+            )
         result: Final = await self._monitor_scan(scan, dynamic_body, request_data, logging_obj)
         if isinstance(result, _MonitorFailure):
             return self._handle_monitor_failure(
-                result, inputs, request_data, logging_obj, is_output=is_output, start_time=start_time
+                result,
+                inputs,
+                request_data,
+                logging_obj,
+                is_output=is_output,
+                start_time=start_time,
+                client_policy="policy_id" in dynamic_body,
             )
 
         outcome: Final = _FLAGGED_OUTCOME[self.on_flagged_action] if self._is_flagged(result) else "allow"
@@ -623,7 +676,7 @@ class GraySwanGuardrail(CustomGuardrail):
     async def _monitor_scan(
         self,
         scan: _ScanInput,
-        dynamic_body: dict,
+        dynamic_body: Mapping[str, object],
         request_data: Mapping[str, object],
         logging_obj: Optional["LiteLLMLoggingObj"],
     ) -> _GraySwanMonitorResponse | _MonitorFailure:
@@ -658,8 +711,11 @@ class GraySwanGuardrail(CustomGuardrail):
         *,
         is_output: bool,
         start_time: float,
+        client_policy: bool,
     ) -> GenericGuardrailAPIInputs:
-        fail_open: Final = self.fail_open_output if is_output else self.fail_open_input
+        fail_open: Final = not failure.rejected_payload(client_policy=client_policy) and (
+            self.fail_open_output if is_output else self.fail_open_input
+        )
         status_code: Final = failure.status_code
         self._record_scan(
             request_data,
@@ -952,6 +1008,8 @@ class GraySwanGuardrail(CustomGuardrail):
                 "Gray Swan Guardrail: Passthrough mode - replacing content with violation message"
             )
 
+            if is_output and request_data.get("stream") is True and not self.streaming_buffer_until_moderated:
+                raise self._block_exception(response_json, violated_rules, is_output=is_output)
             if not is_output or request_data.get("stream") is True:
                 self.raise_passthrough_exception(
                     violation_message=violation_message,
@@ -1101,7 +1159,7 @@ class GraySwanGuardrail(CustomGuardrail):
     def _prepare_payload(
         self,
         messages: Sequence[Mapping[str, object]],
-        dynamic_body: dict,
+        dynamic_body: Mapping[str, object],
         request_data: Mapping[str, object],
         logging_obj: Optional["LiteLLMLoggingObj"] = None,
         *,
