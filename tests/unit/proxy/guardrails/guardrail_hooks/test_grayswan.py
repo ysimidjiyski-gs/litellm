@@ -1622,20 +1622,28 @@ async def test_payload_rejection_without_any_text_to_rescan_fails_closed() -> No
 
 
 @pytest.mark.parametrize(
-    ("status", "dynamic_policy", "fails_open"),
-    [(401, False, True), (403, False, True), (500, False, True), (404, False, True), (404, True, False)],
+    ("status", "extra_body", "fails_open"),
+    [
+        (401, None, True),
+        (403, None, True),
+        (404, None, True),
+        (500, None, True),
+        (403, {"policy_id": "another-orgs-policy"}, False),
+        (404, {"policy_id": "unknown-policy"}, False),
+        (401, {"reasoning_mode": "thinking"}, False),
+        (429, {"categories": ["safety"]}, False),
+        (500, {"policy_id": "policy-1"}, True),
+    ],
 )
 @pytest.mark.asyncio
 async def test_only_operator_and_availability_errors_follow_fail_open(
-    monkeypatch: pytest.MonkeyPatch, status: int, dynamic_policy: bool, fails_open: bool
+    monkeypatch: pytest.MonkeyPatch, status: int, extra_body: dict[str, object] | None, fails_open: bool
 ) -> None:
     monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
     guardrail = _guardrail(fail_open=True)
     guardrail.async_handler = _StrictMonitor(rejects=lambda _message: True, status=status)
     request_data: dict[str, object] = (
-        {"guardrails": [{"grayswan-test": {"extra_body": {"policy_id": "someone-elses-policy"}}}]}
-        if dynamic_policy
-        else {}
+        {"guardrails": [{"grayswan-test": {"extra_body": extra_body}}]} if extra_body is not None else {}
     )
 
     call = guardrail.apply_guardrail(inputs={"texts": ["hi"]}, request_data=request_data, input_type="request")
@@ -1730,3 +1738,34 @@ async def test_streamed_passthrough_without_buffering_ends_with_the_block_error(
         )
 
     assert isinstance(exc.value, ModifyResponseException) == buffered
+
+
+@pytest.mark.parametrize(
+    ("guardrail_config", "mask_response_content", "raised"),
+    [
+        (None, False, ModifyResponseException),
+        ({"streaming_buffer_until_moderated": False}, False, HTTPException),
+        (None, True, HTTPException),
+    ],
+)
+@pytest.mark.asyncio
+async def test_streamed_passthrough_follows_the_buffering_the_stream_hook_will_use(
+    guardrail_config: dict[str, object] | None, mask_response_content: bool, raised: type[Exception]
+) -> None:
+    guardrail = GraySwanGuardrail(
+        guardrail_name="grayswan-post-call",
+        api_key="test-key",
+        on_flagged_action="passthrough",
+        mask_response_content=mask_response_content,
+        event_hook=GuardrailEventHooks.post_call,
+    )
+    if guardrail_config is not None:
+        guardrail.guardrail_config = guardrail_config
+    guardrail.async_handler = _CapturingClient({"violation": 1.0})
+
+    with pytest.raises(raised) as exc:
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["flagged text"]}, request_data={"stream": True}, input_type="response"
+        )
+
+    assert isinstance(exc.value, ModifyResponseException) == (raised is ModifyResponseException)

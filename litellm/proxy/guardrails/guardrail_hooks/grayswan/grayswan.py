@@ -135,8 +135,9 @@ class _MonitorFailure:
     def rejected_shape(self) -> bool:
         return not self.timed_out and self.status_code in _SHAPE_REJECTION_STATUSES
 
-    def rejected_payload(self, *, client_policy: bool) -> bool:
-        return self.rejected_shape or (client_policy and self.status_code == 404)
+    def rejected_payload(self, *, client_steered: bool) -> bool:
+        status: Final = self.status_code
+        return self.rejected_shape or (client_steered and status is not None and 400 <= status < 500)
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,7 +618,7 @@ class GraySwanGuardrail(CustomGuardrail):
                 logging_obj,
                 is_output=is_output,
                 start_time=start_time,
-                client_policy="policy_id" in dynamic_body,
+                client_steered=bool(dynamic_body),
             )
 
         outcome: Final = _FLAGGED_OUTCOME[self.on_flagged_action] if self._is_flagged(result) else "allow"
@@ -711,9 +712,9 @@ class GraySwanGuardrail(CustomGuardrail):
         *,
         is_output: bool,
         start_time: float,
-        client_policy: bool,
+        client_steered: bool,
     ) -> GenericGuardrailAPIInputs:
-        fail_open: Final = not failure.rejected_payload(client_policy=client_policy) and (
+        fail_open: Final = not failure.rejected_payload(client_steered=client_steered) and (
             self.fail_open_output if is_output else self.fail_open_input
         )
         status_code: Final = failure.status_code
@@ -735,6 +736,16 @@ class GraySwanGuardrail(CustomGuardrail):
         if fail_open:
             return inputs
         raise GraySwanGuardrailAPIError(str(failure.error), status_code=status_code) from failure.error
+
+    def _buffers_streams(self) -> bool:
+        from litellm.proxy.guardrails.guardrail_hooks.unified_guardrail.unified_guardrail import (
+            UnifiedLLMGuardrails,
+        )
+
+        configured: Final = UnifiedLLMGuardrails().resolve_streaming_flag(
+            self, "streaming_buffer_until_moderated", True
+        )
+        return configured is not False and not self.mask_response_content
 
     def _request_stage(self) -> GuardrailEventHooks:
         hooks: Final = self.event_hook if isinstance(self.event_hook, list) else (self.event_hook,)
@@ -1008,7 +1019,7 @@ class GraySwanGuardrail(CustomGuardrail):
                 "Gray Swan Guardrail: Passthrough mode - replacing content with violation message"
             )
 
-            if is_output and request_data.get("stream") is True and not self.streaming_buffer_until_moderated:
+            if is_output and request_data.get("stream") is True and not self._buffers_streams():
                 raise self._block_exception(response_json, violated_rules, is_output=is_output)
             if not is_output or request_data.get("stream") is True:
                 self.raise_passthrough_exception(
