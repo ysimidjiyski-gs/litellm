@@ -68,15 +68,15 @@ class GraySwanGuardrailConfigModelOptionalParams(LiteLLMBaseModel):
     )
     extra_headers: list[str] | None = Field(
         default=None,
-        description="Inbound request header names to forward to Gray Swan in metadata.headers, in addition to the built-in Claude Code and Codex session headers. Credential headers (authorization, cookies, API keys, tokens, secrets) are never forwarded.",
+        description="Inbound request header names to forward to Gray Swan in metadata.headers, in addition to the built-in Claude Code and Codex session headers. A header whose name contains auth, cookie, key, token, secret, password, credential, signature, cert or jwt is never forwarded, nor is the configured litellm_key_header_name.",
     )
     monitor_headers: dict[str, str] | None = Field(
         default=None,
-        description="Static headers added to every call to Gray Swan's monitor endpoint, e.g. {'x-cygnal-model': '...'} to pick the judge.",
+        description="Static headers added to every call to Gray Swan's monitor endpoint, e.g. {'x-cygnal-model': '...'} to pick the judge. Names are lowercased, values must be strings, and the authorization, content-type and Gray Swan API key headers cannot be overridden.",
     )
     streaming_buffer_until_moderated: bool | None = Field(
         default=True,
-        description="If true (default), streamed responses are withheld until the end-of-stream post_call scan passes, so flagged output never reaches the client. Set false to stream live and scan afterwards.",
+        description="If true (default), streamed responses are withheld until the end-of-stream post_call scan passes. Flagged output then never reaches the client in block mode, and in passthrough mode the client gets the violation message instead. Monitor mode releases flagged output by design. Set false to stream live and scan afterwards.",
     )
 
 

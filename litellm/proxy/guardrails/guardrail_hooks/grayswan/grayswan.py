@@ -1,10 +1,12 @@
 """Gray Swan Cygnal guardrail integration."""
 
+import json
 import os
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from itertools import chain
+from itertools import accumulate, chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, Optional, Protocol, TypeAlias, cast
 
@@ -56,17 +58,28 @@ DEFAULT_FORWARDED_HEADERS: Final = (
 )
 SESSION_ID_HEADERS: Final = ("x-claude-code-session-id", "session-id")
 _CREDENTIAL_HEADER_MARKERS: Final = (
-    "authorization",
+    "auth",
     "cookie",
-    "api-key",
-    "api_key",
-    "apikey",
+    "key",
     "token",
     "secret",
     "password",
     "credential",
+    "signature",
+    "cert",
+    "jwt",
 )
+_RESERVED_MONITOR_HEADERS: Final = frozenset(
+    {"authorization", "content-type", "grayswan-api-key", "x-grayswan-api-key"}
+)
+_SHAPE_REJECTION_STATUSES: Final = frozenset({400, 413, 422})
+_MEDIA_PART_TYPES: Final = frozenset(
+    {"image", "image_url", "input_image", "input_audio", "audio", "input_file", "file", "document", "video_url"}
+)
+_REBUILT_MESSAGE_KEYS: Final = frozenset({"role", "content", "tool_calls", "function_call", "tool_call_id"})
 _FORWARDED_LITELLM_METADATA_FIELDS: Final = (
+    "user_api_key_hash",
+    "user_api_key_spend",
     "user_api_key_alias",
     "user_api_key_user_id",
     "user_api_key_user_email",
@@ -111,6 +124,22 @@ class _GraySwanMonitorResponse(TypedDict):
 class _MonitorFailure:
     error: Exception
     timed_out: bool
+
+    @property
+    def status_code(self) -> int | None:
+        status: Final = getattr(self.error, "status_code", None)
+        return status if isinstance(status, int) else None
+
+    @property
+    def rejected_shape(self) -> bool:
+        return not self.timed_out and self.status_code in _SHAPE_REJECTION_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class _ScanInput:
+    messages: Sequence[Mapping[str, object]]
+    tools: Sequence[object] | None
+    fallback: Sequence[Mapping[str, object]] | None
 
 
 class _CustomGuardrailOptions(TypedDict, total=False, extra_items=object):
@@ -158,6 +187,159 @@ def _is_credential_header(name: str) -> bool:
 
 def _as_mapping(value: object) -> Mapping[str, object]:
     return cast("Mapping[str, object]", value) if isinstance(value, Mapping) else {}  # cast-ok: metadata dicts
+
+
+def _configured_litellm_key_header() -> str | None:
+    proxy_server: Final = sys.modules.get("litellm.proxy.proxy_server")
+    name: Final = _as_mapping(getattr(proxy_server, "general_settings", None)).get("litellm_key_header_name")
+    return name.lower() if isinstance(name, str) else None
+
+
+def _as_items(value: object) -> tuple[object, ...]:
+    return tuple(cast("Sequence[object]", value)) if isinstance(value, (list, tuple)) else ()  # cast-ok: JSON arrays
+
+
+def _is_media_part(part: object) -> bool:
+    return _as_mapping(part).get("type") in _MEDIA_PART_TYPES
+
+
+def _is_wire_tool_call(call: object) -> bool:
+    fields: Final = _as_mapping(call)
+    function: Final = _as_mapping(fields.get("function"))
+    call_id: Final = fields.get("id")
+    return (
+        fields.get("type") == "function"
+        and isinstance(call_id, str)
+        and bool(call_id)
+        and isinstance(function.get("name"), str)
+        and isinstance(function.get("arguments"), str)
+    )
+
+
+def _needs_normalization(message: Mapping[str, object]) -> bool:
+    content: Final = message.get("content")
+    tool_calls: Final = message.get("tool_calls")
+    return (
+        message.get("role") == "function"
+        or "function_call" in message
+        or not all(_is_wire_tool_call(call) for call in _as_items(tool_calls))
+        or any(_is_media_part(part) for part in _as_items(content))
+    )
+
+
+def _arguments(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    return "" if value is None else json.dumps(value)
+
+
+def _wire_tool_call(call: object, fallback_id: str) -> Mapping[str, object]:
+    fields: Final = _as_plain_dict(call)
+    is_custom: Final = fields.get("type") == "custom"
+    custom: Final = _as_mapping(fields.get("custom"))
+    function: Final = _as_mapping(fields.get("function"))
+    name: Final = custom.get("name") if is_custom else function.get("name")
+    custom_input: Final = custom.get("input")
+    custom_arguments: Final = custom_input if isinstance(custom_input, str) else _arguments(custom_input)
+    call_id: Final = fields.get("id")
+    return {
+        "id": call_id if isinstance(call_id, str) and call_id else fallback_id,
+        "type": "function",
+        "function": {
+            "name": name if isinstance(name, str) else "",
+            "arguments": custom_arguments if is_custom else _arguments(function.get("arguments")),
+        },
+    }
+
+
+def _legacy_tool_calls(function_call: object, call_id: str | None) -> tuple[Mapping[str, object], ...]:
+    fields: Final = _as_mapping(function_call)
+    if not fields or call_id is None:
+        return ()
+    name: Final = fields.get("name")
+    return (
+        {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name if isinstance(name, str) else "",
+                "arguments": _arguments(fields.get("arguments")),
+            },
+        },
+    )
+
+
+def _without_media(content: object) -> object:
+    parts: Final = _as_items(content)
+    if not parts:
+        return content
+    return tuple(part for part in parts if not _is_media_part(part)) or None
+
+
+def _normalize_message(message: Mapping[str, object], index: int, legacy_call_id: str | None) -> Mapping[str, object]:
+    is_function_result: Final = message.get("role") == "function"
+    raw_tool_calls: Final = _as_items(message.get("tool_calls"))
+    tool_calls: Final = (
+        tuple(_wire_tool_call(call, f"call_{index}_{position}") for position, call in enumerate(raw_tool_calls))
+        if raw_tool_calls
+        else _legacy_tool_calls(message.get("function_call"), legacy_call_id)
+    )
+    tool_call_id: Final = message.get("tool_call_id") or (legacy_call_id if is_function_result else None)
+    return {
+        **{key: value for key, value in message.items() if key not in _REBUILT_MESSAGE_KEYS},
+        "role": "tool" if is_function_result else message.get("role"),
+        **({"content": _without_media(message.get("content"))} if "content" in message else {}),
+        **({"tool_calls": tool_calls} if tool_calls else {}),
+        **({"tool_call_id": tool_call_id} if tool_call_id else {}),
+    }
+
+
+def _latest_call_id(previous: str | None, current: str | None) -> str | None:
+    return current or previous
+
+
+def _monitor_wire_messages(messages: Sequence[Mapping[str, object]]) -> tuple[Mapping[str, object], ...]:
+    """Messages in the shape Cygnal's CreateMonitorRequest validates.
+
+    Legacy `function_call` turns and their `function` results become tool calls and tool results
+    paired by a synthesized id, custom tool calls become function calls, and media parts are dropped.
+    """
+    legacy_call_ids: Final = tuple(
+        accumulate(
+            (f"call_legacy_{index}" if "function_call" in message else None for index, message in enumerate(messages)),
+            _latest_call_id,
+        )
+    )
+    return tuple(
+        _normalize_message(message, index, legacy_call_ids[index]) if _needs_normalization(message) else message
+        for index, message in enumerate(messages)
+    )
+
+
+def _monitor_headers(configured: object) -> Mapping[str, str]:
+    if configured is None:
+        return MappingProxyType({})
+    if not isinstance(configured, Mapping):
+        raise GraySwanGuardrailConfigError("Gray Swan Guardrail: monitor_headers must map header names to strings")
+    entries: Final = tuple(cast("Mapping[object, object]", configured).items())  # cast-ok: checked as a Mapping above
+    if not all(isinstance(value, str) for _, value in entries):
+        raise GraySwanGuardrailConfigError("Gray Swan Guardrail: monitor_headers values must be strings")
+    return MappingProxyType(
+        {str(name).lower(): str(value) for name, value in entries if str(name).lower() not in _RESERVED_MONITOR_HEADERS}
+    )
+
+
+def _block_status_code(configured: object) -> int:
+    try:
+        status: Final = 400 if configured is None else int(cast("int | str", configured))  # cast-ok: parsed below
+    except (TypeError, ValueError) as exc:
+        raise GraySwanGuardrailConfigError(f"Gray Swan Guardrail: invalid block_status_code {configured!r}") from exc
+    if status not in GRAYSWAN_BLOCK_STATUS_CODES:
+        raise GraySwanGuardrailConfigError(
+            f"Gray Swan Guardrail: block_status_code must be one of {sorted(GRAYSWAN_BLOCK_STATUS_CODES)} "
+            "so router retries and fallbacks treat the block as a guardrail intervention"
+        )
+    return status
 
 
 def _chat_shape_tools(handler_cls: type["BaseTranslation"], raw_tools: Sequence[object]) -> tuple[object, ...]:
@@ -280,13 +462,7 @@ class GraySwanGuardrail(CustomGuardrail):
                 )
             self.on_flagged_action = self.DEFAULT_ON_FLAGGED_ACTION
 
-        resolved_block_status: Final = 400 if block_status_code is None else int(block_status_code)
-        if resolved_block_status not in GRAYSWAN_BLOCK_STATUS_CODES:
-            raise GraySwanGuardrailConfigError(
-                f"Gray Swan Guardrail: block_status_code must be one of {sorted(GRAYSWAN_BLOCK_STATUS_CODES)} "
-                "so router retries and fallbacks treat the block as a guardrail intervention"
-            )
-        self.block_status_code = resolved_block_status
+        self.block_status_code = _block_status_code(block_status_code)
         self.block_message = block_message or GRAYSWAN_BLOCK_ERROR_MSG
 
         self.violation_threshold = self._resolve_threshold(violation_threshold)
@@ -294,7 +470,7 @@ class GraySwanGuardrail(CustomGuardrail):
         self.flag_on_mutation = flag_on_mutation is not False
         self.reasoning_mode = self._resolve_reasoning_mode(reasoning_mode)
         self.categories = categories
-        self.policy_id = policy_id
+        self.policy_id = None if policy_id is None else str(policy_id)
         self.fail_open = True if fail_open is None else bool(fail_open)
         self.fail_open_input = self.fail_open if fail_open_input is None else bool(fail_open_input)
         self.fail_open_output = self.fail_open if fail_open_output is None else bool(fail_open_output)
@@ -302,7 +478,7 @@ class GraySwanGuardrail(CustomGuardrail):
         self.forwarded_header_names = frozenset(
             (*DEFAULT_FORWARDED_HEADERS, *(name.lower() for name in extra_headers or ()))
         )
-        self.monitor_headers: Mapping[str, str] = MappingProxyType(dict(monitor_headers or {}))
+        self.monitor_headers: Mapping[str, str] = _monitor_headers(monitor_headers)
 
         # Streaming configuration
         self.streaming_end_of_stream_only = streaming_end_of_stream_only
@@ -374,19 +550,18 @@ class GraySwanGuardrail(CustomGuardrail):
         """
         is_output: Final = input_type == "response"
         start_time: Final = time.time()
-        messages, tools = (
+        scan: Final = (
             self._response_scan_input(inputs, request_data, logging_obj)
             if is_output
             else self._request_scan_input(inputs)
         )
-        if not messages:
+        if not scan.messages:
             verbose_proxy_logger.debug("Gray Swan Guardrail: nothing to scan for %s", input_type)
             self._record_scan(request_data, logging_obj, is_output=is_output, outcome="skipped", start_time=start_time)
             return inputs
 
         dynamic_body: Final = self.get_guardrail_dynamic_request_body_params(request_data) or {}
-        payload: Final = self._prepare_payload(messages, dynamic_body, request_data, logging_obj, tools=tools)
-        result: Final = await self._monitor(payload)
+        result: Final = await self._monitor_scan(scan, dynamic_body, request_data, logging_obj)
         if isinstance(result, _MonitorFailure):
             return self._handle_monitor_failure(
                 result, inputs, request_data, logging_obj, is_output=is_output, start_time=start_time
@@ -408,25 +583,24 @@ class GraySwanGuardrail(CustomGuardrail):
             is_output=is_output,
         )
 
-    def _request_scan_input(
-        self, inputs: GenericGuardrailAPIInputs
-    ) -> tuple[tuple[Mapping[str, object], ...], tuple[Mapping[str, object], ...] | None]:
+    def _request_scan_input(self, inputs: GenericGuardrailAPIInputs) -> _ScanInput:
         structured: Final = tuple(_as_plain_dict(message) for message in inputs.get("structured_messages") or ())
         tools: Final = tuple(_as_plain_dict(tool) for tool in inputs.get("tools") or ()) or None
+        texts: Final = tuple(_MonitorMessage(role="user", content=text) for text in inputs.get("texts", []))
         if structured and all(_is_chat_message(message) for message in structured):
-            return structured, tools
-        return tuple(_MonitorMessage(role="user", content=text) for text in inputs.get("texts", [])), tools
+            return _ScanInput(messages=structured, tools=tools, fallback=texts or None)
+        return _ScanInput(messages=texts, tools=tools, fallback=None)
 
     def _response_scan_input(
         self,
         inputs: GenericGuardrailAPIInputs,
         request_data: Mapping[str, object],
         logging_obj: Optional["LiteLLMLoggingObj"],
-    ) -> tuple[tuple[Mapping[str, object], ...], tuple[object, ...] | None]:
+    ) -> _ScanInput:
         texts: Final = inputs.get("texts", [])
         response_tool_calls: Final = tuple(_as_plain_dict(call) for call in (inputs.get("tool_calls") or ()))
         if not texts and not response_tool_calls:
-            return (), None
+            return _ScanInput(messages=(), tools=None, fallback=None)
         context, tools = self._post_call_context(
             request_data, logging_obj, effective_scan_only_tool_results_for_guardrail(self)
         )
@@ -435,8 +609,7 @@ class GraySwanGuardrail(CustomGuardrail):
             if len(texts) == 1 and response_tool_calls
             else None
         )
-        messages: Final = (
-            *context,
+        reply: Final = (
             *(_MonitorMessage(role="assistant", content=text) for text in (texts[:-1] if merged_tail else texts)),
             *((merged_tail,) if merged_tail else ()),
             *(
@@ -445,7 +618,29 @@ class GraySwanGuardrail(CustomGuardrail):
                 else ()
             ),
         )
-        return messages, tools
+        return _ScanInput(messages=(*context, *reply), tools=tools, fallback=reply if context else None)
+
+    async def _monitor_scan(
+        self,
+        scan: _ScanInput,
+        dynamic_body: dict,
+        request_data: Mapping[str, object],
+        logging_obj: Optional["LiteLLMLoggingObj"],
+    ) -> _GraySwanMonitorResponse | _MonitorFailure:
+        first: Final = await self._monitor(
+            self._prepare_payload(
+                _monitor_wire_messages(scan.messages), dynamic_body, request_data, logging_obj, tools=scan.tools
+            )
+        )
+        if not isinstance(first, _MonitorFailure) or not first.rejected_shape or scan.fallback is None:
+            return first
+        verbose_proxy_logger.warning(
+            "Gray Swan Guardrail: monitor rejected the conversation (status_code=%s), rescanning the extracted text",
+            first.status_code,
+        )
+        return await self._monitor(
+            self._prepare_payload(_monitor_wire_messages(scan.fallback), dynamic_body, request_data, logging_obj)
+        )
 
     async def _monitor(self, payload: Mapping[str, object]) -> _GraySwanMonitorResponse | _MonitorFailure:
         try:
@@ -465,7 +660,7 @@ class GraySwanGuardrail(CustomGuardrail):
         start_time: float,
     ) -> GenericGuardrailAPIInputs:
         fail_open: Final = self.fail_open_output if is_output else self.fail_open_input
-        status_code: Final = getattr(failure.error, "status_code", None)
+        status_code: Final = failure.status_code
         self._record_scan(
             request_data,
             logging_obj,
@@ -484,6 +679,11 @@ class GraySwanGuardrail(CustomGuardrail):
         if fail_open:
             return inputs
         raise GraySwanGuardrailAPIError(str(failure.error), status_code=status_code) from failure.error
+
+    def _request_stage(self) -> GuardrailEventHooks:
+        hooks: Final = self.event_hook if isinstance(self.event_hook, list) else (self.event_hook,)
+        only_during_call: Final = GuardrailEventHooks.during_call in hooks and GuardrailEventHooks.pre_call not in hooks
+        return GuardrailEventHooks.during_call if only_during_call else GuardrailEventHooks.pre_call
 
     def _is_flagged(self, response_json: _GraySwanMonitorResponse) -> bool:
         violation_score: Final = float(response_json.get("violation", 0.0) or 0.0)
@@ -526,7 +726,7 @@ class GraySwanGuardrail(CustomGuardrail):
         failure: _MonitorFailure | None = None,
     ) -> None:
         end_time: Final = time.time()
-        stage: Final = GuardrailEventHooks.post_call if is_output else GuardrailEventHooks.pre_call
+        stage: Final = GuardrailEventHooks.post_call if is_output else self._request_stage()
         activity_id: Final = response_json.get("activity_id") if response_json else None
         verdict: Final = response_json or {}
         self.add_standard_logging_guardrail_information_to_request_data(
@@ -546,7 +746,7 @@ class GraySwanGuardrail(CustomGuardrail):
             end_time=end_time,
             duration=end_time - start_time,
             guardrail_provider="grayswan",
-            event_type=stage if is_output else None,
+            event_type=stage,
         )
         add_guardrail_scan_id(
             request_data,
@@ -752,9 +952,7 @@ class GraySwanGuardrail(CustomGuardrail):
                 "Gray Swan Guardrail: Passthrough mode - replacing content with violation message"
             )
 
-            if not is_output:
-                # For pre-call (request), raise exception to short-circuit LLM call
-                # and return synthetic response with violation message
+            if not is_output or request_data.get("stream") is True:
                 self.raise_passthrough_exception(
                     violation_message=violation_message,
                     request_data=request_data,
@@ -774,8 +972,8 @@ class GraySwanGuardrail(CustomGuardrail):
     def _prepare_headers(self) -> dict[str, str]:
         return {
             **self.monitor_headers,
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
+            "authorization": f"Bearer {self.api_key}",
+            "content-type": "application/json",
             "grayswan-api-key": self.api_key,
         }
 
@@ -800,7 +998,11 @@ class GraySwanGuardrail(CustomGuardrail):
         return forwarded_headers or None
 
     def _forwards_header(self, name: str) -> bool:
-        return name in self.forwarded_header_names and not _is_credential_header(name)
+        return (
+            name in self.forwarded_header_names
+            and not _is_credential_header(name)
+            and name != _configured_litellm_key_header()
+        )
 
     def _monitor_metadata(
         self,
@@ -950,7 +1152,7 @@ class GraySwanGuardrail(CustomGuardrail):
         mutation: Final = detection_dict.get("mutation", False)
         ipi: Final = detection_dict.get("ipi", False)
 
-        violation_location: Final = "the model response" if is_output else "input query"
+        violation_location: Final = "model response" if is_output else "input query"
 
         message_parts: Final = [
             f"Sorry I can't help with that. According to the Gray Swan Cygnal Guardrail, "
