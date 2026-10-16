@@ -7,6 +7,8 @@ from litellm.types.guardrails import SupportedGuardrailIntegrations
 from .grayswan import (
     GraySwanGuardrail,
     GraySwanGuardrailAPIError,
+    GraySwanGuardrailBlocked,
+    GraySwanGuardrailConfigError,
     GraySwanGuardrailMissingSecrets,
 )
 
@@ -35,8 +37,19 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
         streaming_end_of_stream_only=_get_config_value(litellm_params, optional_params, "streaming_end_of_stream_only")
         or False,
         streaming_sampling_rate=_get_config_value(litellm_params, optional_params, "streaming_sampling_rate") or 5,
+        streaming_buffer_until_moderated=_get_config_value(
+            litellm_params, optional_params, "streaming_buffer_until_moderated"
+        ),
         fail_open=_get_config_value(litellm_params, optional_params, "fail_open"),
+        fail_open_input=_get_config_value(litellm_params, optional_params, "fail_open_input"),
+        fail_open_output=_get_config_value(litellm_params, optional_params, "fail_open_output"),
         guardrail_timeout=_get_config_value(litellm_params, optional_params, "guardrail_timeout"),
+        flag_on_ipi=_get_config_value(litellm_params, optional_params, "flag_on_ipi"),
+        flag_on_mutation=_get_config_value(litellm_params, optional_params, "flag_on_mutation"),
+        block_status_code=_get_config_value(litellm_params, optional_params, "block_status_code"),
+        block_message=_get_config_value(litellm_params, optional_params, "block_message"),
+        extra_headers=_get_config_value(litellm_params, optional_params, "extra_headers"),
+        monitor_headers=_get_config_value(litellm_params, optional_params, "monitor_headers"),
         event_hook=litellm_params.mode,
         default_on=litellm_params.default_on,
     )
@@ -66,6 +79,8 @@ guardrail_class_registry: Final = {
 __all__ = [
     "GraySwanGuardrail",
     "GraySwanGuardrailAPIError",
+    "GraySwanGuardrailBlocked",
+    "GraySwanGuardrailConfigError",
     "GraySwanGuardrailMissingSecrets",
     "initialize_guardrail",
 ]

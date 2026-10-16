@@ -5,6 +5,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
+import pytest
 import yaml
 from integration._support.client import Gateway, eventually
 from integration._support.process import owned_proxy
@@ -66,6 +67,7 @@ def _grayswan_config(
     *,
     on_flagged_action: str = "monitor",
     streaming_end_of_stream_only: bool = False,
+    streaming_buffer_until_moderated: bool = True,
     default_on: bool = True,
     fail_open: bool | None = None,
     skip_system: bool | None = None,
@@ -85,6 +87,7 @@ def _grayswan_config(
                     "api_base": vendor_url,
                     "api_key": _VENDOR_KEY,
                     "streaming_end_of_stream_only": streaming_end_of_stream_only,
+                    "streaming_buffer_until_moderated": streaming_buffer_until_moderated,
                     **({"skip_system_message_in_guardrail": skip_system} if skip_system is not None else {}),
                     **({"skip_tool_message_in_guardrail": skip_tool} if skip_tool is not None else {}),
                     **(
@@ -447,7 +450,7 @@ def test_post_call_streams_end_of_stream_with_conversation(gateway: Gateway, tmp
             ], body
 
 
-def test_pre_call_payload_shape_unchanged(gateway: Gateway, tmp_path: Path) -> None:
+def test_pre_call_sends_conversation_and_tools(gateway: Gateway, tmp_path: Path) -> None:
     identity: Final = "grayswan" + uuid.uuid4().hex
     system_text: Final = "You are a mail assistant."
     user_text: Final = f"summarize my inbox {identity}"
@@ -475,10 +478,10 @@ def test_pre_call_payload_shape_unchanged(gateway: Gateway, tmp_path: Path) -> N
             assert response.status_code == 200, response.text
             (body,) = _monitor_bodies(vendor)
             assert body["messages"] == [
-                {"role": "user", "content": system_text},
+                {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
             ], body
-            assert "tools" not in body, body
+            assert body["tools"] == [dict(tool) for tool in _TOOLS], body
 
 
 def test_post_call_merges_text_and_tool_calls_into_one_message(gateway: Gateway, tmp_path: Path) -> None:
@@ -601,7 +604,9 @@ def test_post_call_sampled_stream_calls_each_carry_context(gateway: Gateway, tmp
     identity: Final = "grayswan" + uuid.uuid4().hex
 
     with wire_server(_vendor()) as vendor, wire_server(_chat_stream_provider(12)) as upstream:
-        config_path: Final = _grayswan_config(tmp_path, identity, vendor.url, "post_call")
+        config_path: Final = _grayswan_config(
+            tmp_path, identity, vendor.url, "post_call", streaming_buffer_until_moderated=False
+        )
         with owned_proxy(gateway, tmp_path, {}, config=config_path) as candidate, candidate.scenario() as scenario:
             model: Final = scenario.model(model="openai/gpt-4o-mini", api_base=upstream.url, api_key=_PROVIDER_KEY)
             response: Final = candidate.request(
@@ -757,7 +762,17 @@ def test_post_call_responses_stream_sends_conversation(gateway: Gateway, tmp_pat
                 and response_text in str(message.get("content", ""))
                 for message in messages
             ), body
-            assert body.get("tools") == [responses_tool], body
+            assert body.get("tools") == [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "send_email",
+                        "description": "Send an email",
+                        "parameters": responses_tool["parameters"],
+                        "strict": False,
+                    },
+                }
+            ], body
 
 
 def test_post_call_openai_sdk_sync_and_async(gateway: Gateway, tmp_path: Path) -> None:
@@ -1565,4 +1580,77 @@ def test_post_call_dynamic_extra_body_merged_with_context(gateway: Gateway, tmp_
             (body,) = _monitor_bodies(vendor)
             assert body["messages"][:-1] == [dict(message) for message in _REQUEST_MESSAGES], body
             assert body["tools"] == [dict(tool) for tool in _TOOLS], body
-            assert body.get("metadata") == {"audit": "e5"}, body
+            assert body.get("metadata") == {
+                "headers": {"user-agent": response.request.headers["user-agent"]},
+                "audit": "e5",
+            }, body
+
+
+def _strict_vendor() -> Callable[[Request], Reply]:
+    def accepted(message: JsonValue) -> bool:
+        if not isinstance(message, dict) or message.get("role") not in {"system", "user", "assistant", "tool"}:
+            return False
+        calls: Final = message.get("tool_calls") or []
+        return isinstance(calls, list) and all(
+            isinstance(call, dict) and isinstance(call.get("id"), str) and isinstance(call.get("function"), dict)
+            for call in calls
+        )
+
+    def respond(request: Request) -> Reply:
+        messages: Final = _JSON_OBJECT.validate_json(request.body).get("messages")
+        if not isinstance(messages, list) or not all(accepted(message) for message in messages):
+            return Reply(status=422, body=b'{"detail":"unsupported message shape"}')
+        return Reply(body=json.dumps({"violation": 1.0}).encode())
+
+    return respond
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "user", "content": "summarize my inbox"},
+            {"role": "assistant", "content": None, "function_call": {"name": "read_inbox", "arguments": "{}"}},
+            {"role": "function", "name": "read_inbox", "content": f"Inbox: {_INJECTED}"},
+        ],
+        [
+            {"role": "user", "content": "summarize my inbox"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_custom", "type": "custom", "custom": {"name": "read_inbox", "input": "latest"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_custom", "content": f"Inbox: {_INJECTED}"},
+        ],
+        [
+            {"role": "user", "content": "summarize my inbox"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"type": "function", "function": {"name": "read_inbox", "arguments": "{}"}}],
+            },
+            {"role": "tool", "content": f"Inbox: {_INJECTED}"},
+        ],
+    ],
+    ids=["legacy_function_call", "custom_tool_call", "tool_call_without_id"],
+)
+def test_pre_call_blocks_tool_call_shapes_the_monitor_rejects(
+    gateway: Gateway, tmp_path: Path, messages: list[JsonValue]
+) -> None:
+    identity: Final = "grayswan" + uuid.uuid4().hex
+
+    with (
+        wire_server(_strict_vendor()) as vendor,
+        wire_server(_chat_provider({"role": "assistant", "content": "should never be generated"})) as upstream,
+    ):
+        config_path: Final = _grayswan_config(tmp_path, identity, vendor.url, "pre_call", on_flagged_action="block")
+        with owned_proxy(gateway, tmp_path, {}, config=config_path) as candidate, candidate.scenario() as scenario:
+            model: Final = scenario.model(model="openai/gpt-4o-mini", api_base=upstream.url, api_key=_PROVIDER_KEY)
+            response: Final = candidate.request(
+                "POST", "/v1/chat/completions", {"model": model, "max_tokens": 16, "messages": messages}
+            )
+            assert response.status_code == 400, response.text
+            assert "grayswan_guardrail_block" in response.text, response.text
+            assert [request.target for request in upstream.drain() if request.target != "/v1/models"] == []

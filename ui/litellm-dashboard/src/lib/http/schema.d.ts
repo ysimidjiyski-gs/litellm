@@ -36499,9 +36499,9 @@ export interface components {
             } | null;
             /**
              * Policy Id
-             * @description Policy ID for Zscaler AI Guard. Can also be set via ZSCALER_AI_GUARD_POLICY_ID environment variable
+             * @description Policy ID. Gray Swan takes its string policy id. Zscaler AI Guard takes an integer and can also read ZSCALER_AI_GUARD_POLICY_ID.
              */
-            policy_id?: number | null;
+            policy_id?: number | string | null;
             /**
              * Policy Name
              * @description The EnkryptAI policy name to use. Sent via x-enkrypt-policy header.

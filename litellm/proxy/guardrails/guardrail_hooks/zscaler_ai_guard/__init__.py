@@ -14,7 +14,9 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
     _zscaler_ai_guard_callback: Final = ZscalerAIGuard(
         api_base=litellm_params.api_base,
         api_key=litellm_params.api_key,
-        policy_id=litellm_params.policy_id,
+        policy_id=int(litellm_params.policy_id)
+        if isinstance(litellm_params.policy_id, str)
+        else litellm_params.policy_id,
         send_user_api_key_alias=litellm_params.send_user_api_key_alias,
         send_user_api_key_user_id=litellm_params.send_user_api_key_user_id,
         send_user_api_key_team_id=litellm_params.send_user_api_key_team_id,
